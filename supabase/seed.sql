@@ -1,0 +1,2 @@
+-- Seed do ambiente local (rodado por `make db-reset`).
+-- Vazio na fundação: as casas, tarefas e registros de exemplo chegam na Fase 3.

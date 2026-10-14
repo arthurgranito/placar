@@ -1,0 +1,12 @@
+pnpm-lock.yaml
+.next/
+.open-next/
+.wrangler/
+node_modules/
+test-results/
+playwright-report/
+coverage/
+supabase/.temp/
+cloudflare-env.d.ts
+.claude/
+docs/
