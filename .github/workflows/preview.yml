@@ -1,0 +1,126 @@
+name: Preview
+
+# Preview por PR: testes → migrations no Supabase de dev → build OpenNext → versão de preview no Workers.
+# Segredos: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, SUPABASE_ACCESS_TOKEN, SUPABASE_DEV_PROJECT_REF,
+# SUPABASE_DEV_DB_PASSWORD, SUPABASE_DEV_URL, SUPABASE_DEV_ANON_KEY. Nada aqui imprime segredos
+# (sem `set -x`, sem `echo` de variáveis); o GitHub ainda mascara qualquer valor de secret nos logs.
+on:
+  pull_request:
+
+concurrency:
+  group: preview-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  testes:
+    name: Testes
+    uses: ./.github/workflows/ci.yml
+
+  preview:
+    name: Preview no Cloudflare Workers
+    needs: testes
+    # PRs vindos de fork não recebem os secrets: só os testes rodam.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # O Supabase de dev é um só: um `db push` por vez, sem cancelar no meio de uma migration.
+    concurrency:
+      group: supabase-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Migrations no Supabase de dev (sem seed)
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DEV_DB_PASSWORD }}
+          SUPABASE_DEV_PROJECT_REF: ${{ secrets.SUPABASE_DEV_PROJECT_REF }}
+        run: |
+          pnpm exec supabase link --project-ref "$SUPABASE_DEV_PROJECT_REF"
+          pnpm exec supabase db push --yes
+
+      - name: Build (OpenNext) apontando para o Supabase de dev
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.SUPABASE_DEV_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_DEV_ANON_KEY }}
+          # O app lê NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY (src/lib/supabase/env.ts); a anon key serve igual.
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_DEV_ANON_KEY }}
+        run: pnpm run cf:build
+
+      - name: Versão de preview (wrangler versions upload)
+        id: upload
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
+        run: |
+          pnpm exec wrangler versions upload \
+            --preview-alias "pr-${PR_NUMBER}" \
+            --tag "pr-${PR_NUMBER}" \
+            --message "Preview do PR #${PR_NUMBER} (${HEAD_SHA::7})"
+          alias_url=$(jq -r 'select(.type == "version-upload") | .preview_alias_url // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n1)
+          version_url=$(jq -r 'select(.type == "version-upload") | .preview_url // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n1)
+          if [ -z "$alias_url" ] && [ -z "$version_url" ]; then
+            echo "::error::O wrangler não devolveu URL de preview. Confira se o worker já foi publicado uma vez (make deploy) e se o workers.dev está ligado na conta."
+            exit 1
+          fi
+          echo "alias_url=${alias_url}" >> "$GITHUB_OUTPUT"
+          echo "version_url=${version_url}" >> "$GITHUB_OUTPUT"
+
+      - name: Comenta a URL no PR
+        uses: actions/github-script@v8
+        env:
+          ALIAS_URL: ${{ steps.upload.outputs.alias_url }}
+          VERSION_URL: ${{ steps.upload.outputs.version_url }}
+        with:
+          script: |
+            const marker = "<!-- placar-preview -->";
+            const { ALIAS_URL, VERSION_URL, HEAD_SHA } = process.env;
+            const url = ALIAS_URL || VERSION_URL;
+            const body = [
+              marker,
+              "### Preview do Placar",
+              "",
+              `**URL:** ${url}`,
+              "",
+              "| | |",
+              "| --- | --- |",
+              `| Commit | \`${HEAD_SHA.slice(0, 7)}\` |`,
+              ALIAS_URL && VERSION_URL ? `| Desta versão (fixa) | ${VERSION_URL} |` : null,
+              "| Banco | Supabase de desenvolvimento (nuvem), migrations deste PR aplicadas, sem seed |",
+              "",
+              "A URL acima aponta sempre para o último commit deste PR.",
+            ]
+              .filter((line) => line !== null)
+              .join("\n");
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find((c) => c.user.type === "Bot" && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

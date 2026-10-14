@@ -1,0 +1,42 @@
+name: seed-dev
+
+# Roda o supabase/seed.sql no Supabase de desenvolvimento na nuvem. Só manual: o preview por PR
+# aplica migrations mas nunca o seed. Como usa `db push --include-seed`, migrations pendentes
+# também são aplicadas antes, e o CLI só roda de novo um seed que mudou desde a última vez.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmar:
+        description: 'Digite "dev" para rodar o seed no Supabase de desenvolvimento'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  seed:
+    name: Seed no Supabase de dev
+    if: inputs.confirmar == 'dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Mesmo grupo do preview.yml: nunca em paralelo com um `db push` de PR.
+    concurrency:
+      group: supabase-dev
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Migrations + seed no Supabase de dev
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DEV_DB_PASSWORD }}
+          SUPABASE_DEV_PROJECT_REF: ${{ secrets.SUPABASE_DEV_PROJECT_REF }}
+        run: |
+          pnpm exec supabase link --project-ref "$SUPABASE_DEV_PROJECT_REF"
+          pnpm exec supabase db push --include-seed --yes
