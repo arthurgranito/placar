@@ -1,9 +1,10 @@
 name: CI
 
+# Nos PRs, quem chama este workflow é o preview.yml (testes antes do preview).
 on:
-  pull_request:
   push:
     branches: [main]
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
